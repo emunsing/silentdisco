@@ -1,0 +1,29 @@
+{
+  "expo": {
+    "name": "silentdisco",
+    "slug": "silentdisco",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "backgroundColor": "#0a0a0a",
+    "splash": {
+      "backgroundColor": "#0a0a0a"
+    },
+    "ios": {
+      "bundleIdentifier": "com.silentdisco.app",
+      "infoPlist": {
+        "UIBackgroundModes": ["audio"]
+      }
+    },
+    "android": {
+      "package": "com.silentdisco.app"
+    },
+    "plugins": [
+      [
+        "expo-av",
+        {
+          "microphonePermission": false
+        }
+      ]
+    ]
+  }
+}
