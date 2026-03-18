@@ -12,10 +12,35 @@ import { fetchSession, SERVER_URL } from "./src/api";
 
 type AppState = "idle" | "loading" | "syncing" | "playing" | "error";
 
+function formatClock(ms: number): string {
+  const d = new Date(ms);
+  const h = d.getHours().toString().padStart(2, "0");
+  const m = d.getMinutes().toString().padStart(2, "0");
+  const s = d.getSeconds().toString().padStart(2, "0");
+  const mil = d.getMilliseconds().toString().padStart(3, "0");
+  return `${h}:${m}:${s}.${mil}`;
+}
+
+function formatPosition(ms: number): string {
+  const totalSec = Math.floor(ms / 1000);
+  const min = Math.floor(totalSec / 60);
+  const sec = (totalSec % 60).toString().padStart(2, "0");
+  const mil = (ms % 1000).toString().padStart(3, "0");
+  return `${min}:${sec}.${mil}`;
+}
+
 export default function App() {
   const [appState, setAppState] = useState<AppState>("idle");
   const [errorMsg, setErrorMsg] = useState("");
   const soundRef = useRef<Audio.Sound | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const [positionMs, setPositionMs] = useState(0);
+
+  // Live clock — update every 16ms (~60fps)
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 16);
+    return () => clearInterval(id);
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -43,18 +68,33 @@ export default function App() {
       );
       soundRef.current = sound;
 
+      const syncAndPlay = async () => {
+        // Seek to approximate position first (warms up the MP3 decoder)
+        const approxOffset =
+          (Date.now() - session.loopStartTimeMs) % session.trackDurationMs;
+        await sound.setPositionAsync(approxOffset);
+        // Recalculate offset *after* the slow seek completes, right before play,
+        // so the seek+play latency doesn't accumulate as a timing error.
+        const offset =
+          (Date.now() - session.loopStartTimeMs) % session.trackDurationMs;
+        await sound.setPositionAsync(offset);
+        await sound.playAsync();
+      };
+
       sound.setOnPlaybackStatusUpdate((status: AVPlaybackStatus) => {
         if (!status.isLoaded) return;
+        setPositionMs(status.positionMillis);
         if (status.didJustFinish) {
-          sound.setPositionAsync(0).then(() => sound.playAsync());
+          // Re-sync to wall clock on every loop restart rather than blindly
+          // seeking to 0 — prevents timing errors from compounding each loop.
+          syncAndPlay();
         }
       });
 
-      const offsetMs =
-        (Date.now() - session.loopStartTimeMs) % session.trackDurationMs;
+      // Get position updates as fast as expo-av will give them
+      await sound.setProgressUpdateIntervalAsync(16);
 
-      await sound.setPositionAsync(offsetMs);
-      await sound.playAsync();
+      await syncAndPlay();
       setAppState("playing");
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -69,6 +109,7 @@ export default function App() {
       await soundRef.current.unloadAsync();
       soundRef.current = null;
     }
+    setPositionMs(0);
     setAppState("idle");
   }
 
@@ -98,6 +139,14 @@ export default function App() {
   return (
     <View style={styles.container}>
       <StatusBar barStyle="light-content" />
+
+      <View style={styles.debugPanel}>
+        <Text style={styles.debugLabel}>clock</Text>
+        <Text style={styles.debugValue}>{formatClock(nowMs)}</Text>
+        <Text style={styles.debugLabel}>track pos</Text>
+        <Text style={styles.debugValue}>{formatPosition(positionMs)}</Text>
+      </View>
+
       <Text style={styles.title}>silent disco</Text>
       <Pressable
         style={[
@@ -114,9 +163,7 @@ export default function App() {
           <Text style={styles.buttonText}>{buttonLabel}</Text>
         )}
       </Pressable>
-      <Text
-        style={[styles.status, appState === "error" && styles.statusError]}
-      >
+      <Text style={[styles.status, appState === "error" && styles.statusError]}>
         {statusText}
       </Text>
     </View>
@@ -130,6 +177,23 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     gap: 32,
+  },
+  debugPanel: {
+    alignItems: "center",
+    gap: 4,
+  },
+  debugLabel: {
+    color: "#555",
+    fontSize: 11,
+    letterSpacing: 2,
+    textTransform: "uppercase",
+  },
+  debugValue: {
+    color: "#0f0",
+    fontSize: 22,
+    fontVariant: ["tabular-nums"],
+    letterSpacing: 1,
+    fontFamily: "monospace",
   },
   title: {
     color: "#ffffff",
