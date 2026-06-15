@@ -7,7 +7,7 @@ from fastapi.responses import FileResponse
 from mutagen.mp3 import MP3
 
 TRACK_PATH = Path(__file__).parent.parent / "data" / "99440__kara__hiphop_fs_loop1.mp3"
-
+print(TRACK_PATH)
 app = FastAPI()
 
 app.add_middleware(

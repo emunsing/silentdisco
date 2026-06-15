@@ -33,8 +33,12 @@ export default function App() {
   const [appState, setAppState] = useState<AppState>("idle");
   const [errorMsg, setErrorMsg] = useState("");
   const soundRef = useRef<Audio.Sound | null>(null);
+  const trackDurationMsRef = useRef(0);
+  const loopStartMsRef = useRef(0);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [positionMs, setPositionMs] = useState(0);
+  const isSyncingRef = useRef(false);
+  const currentRateRef = useRef(1.0);
 
   // Live clock — update every 16ms (~60fps)
   useEffect(() => {
@@ -60,6 +64,8 @@ export default function App() {
       });
 
       const session = await fetchSession();
+      trackDurationMsRef.current = session.trackDurationMs;
+      loopStartMsRef.current = session.loopStartTimeMs;
       setAppState("syncing");
 
       const { sound } = await Audio.Sound.createAsync(
@@ -68,33 +74,66 @@ export default function App() {
       );
       soundRef.current = sound;
 
-      const syncAndPlay = async () => {
-        // Seek to approximate position first (warms up the MP3 decoder)
+      const hardSync = async () => {
         const approxOffset =
           (Date.now() - session.loopStartTimeMs) % session.trackDurationMs;
         await sound.setPositionAsync(approxOffset);
-        // Recalculate offset *after* the slow seek completes, right before play,
-        // so the seek+play latency doesn't accumulate as a timing error.
         const offset =
           (Date.now() - session.loopStartTimeMs) % session.trackDurationMs;
         await sound.setPositionAsync(offset);
+        await sound.setRateAsync(1.0, true);
         await sound.playAsync();
       };
 
+      // Drift correction via playback rate adjustment.
+      // Small drift (<200ms): nudge rate to 0.98 or 1.02 to close the gap.
+      // Large drift (>=200ms): hard re-seek (unavoidable gap, but rare).
+      const SOFT_DRIFT_THRESHOLD_MS = 30;
+      const HARD_DRIFT_THRESHOLD_MS = 200;
+      const RATE_NUDGE = 0.02;
+
+      // Track desired rate locally to avoid redundant setRateAsync calls
+      const setRateIfChanged = async (rate: number) => {
+        if (currentRateRef.current !== rate) {
+          currentRateRef.current = rate;
+          await sound.setRateAsync(rate, true);
+        }
+      };
+
       sound.setOnPlaybackStatusUpdate((status: AVPlaybackStatus) => {
-        if (!status.isLoaded) return;
+        if (!status.isLoaded || !status.isPlaying) return;
         setPositionMs(status.positionMillis);
+
         if (status.didJustFinish) {
-          // Re-sync to wall clock on every loop restart rather than blindly
-          // seeking to 0 — prevents timing errors from compounding each loop.
-          syncAndPlay();
+          hardSync();
+          return;
+        }
+
+        if (isSyncingRef.current) return;
+
+        const now = Date.now();
+        const wallClockPos =
+          (now - loopStartMsRef.current) % trackDurationMsRef.current;
+        const drift = status.positionMillis - wallClockPos;
+
+        if (Math.abs(drift) >= HARD_DRIFT_THRESHOLD_MS) {
+          isSyncingRef.current = true;
+          hardSync().finally(() => {
+            isSyncingRef.current = false;
+          });
+        } else if (Math.abs(drift) > SOFT_DRIFT_THRESHOLD_MS) {
+          const targetRate = drift > 0 ? 1.0 - RATE_NUDGE : 1.0 + RATE_NUDGE;
+          setRateIfChanged(targetRate);
+        } else {
+          setRateIfChanged(1.0);
         }
       });
 
-      // Get position updates as fast as expo-av will give them
-      await sound.setProgressUpdateIntervalAsync(16);
+      // Check drift every 500ms — frequent enough to correct, rare enough
+      // to not interfere with audio playback
+      await sound.setProgressUpdateIntervalAsync(500);
 
-      await syncAndPlay();
+      await hardSync();
       setAppState("playing");
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -110,6 +149,8 @@ export default function App() {
       soundRef.current = null;
     }
     setPositionMs(0);
+    trackDurationMsRef.current = 0;
+    loopStartMsRef.current = 0;
     setAppState("idle");
   }
 
