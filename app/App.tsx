@@ -13,10 +13,12 @@ import { getOutputLatencyMs } from "./modules/audio-latency";
 
 type AppState = "idle" | "loading" | "syncing" | "playing" | "error";
 
+const DEVICE_ID = Math.random().toString(36).slice(2, 6).toUpperCase();
+
 function formatPosition(ms: number): string {
   const totalSec = Math.floor(ms / 1000);
-  const min = Math.floor(totalSec / 10);
-  const sec = (totalSec % 10).toString().padStart(2, "0");
+  const min = Math.floor(totalSec / 60);
+  const sec = (totalSec % 60).toString().padStart(2, "0");
   const mil = (ms % 1000).toString().padStart(3, "0");
   return `${min}:${sec}.${mil}`;
 }
@@ -28,10 +30,12 @@ export default function App() {
   const trackDurationMsRef = useRef(0);
   const loopStartMsRef = useRef(0);
   const [positionMs, setPositionMs] = useState(0);
+  const [displayRate, setDisplayRate] = useState(1.0);
   const [latencyMs, setLatencyMs] = useState(0);
   const outputLatencyRef = useRef(0);
   const isSyncingRef = useRef(false);
   const currentRateRef = useRef(1.0);
+  const lastRateChangeTimeRef = useRef(0);
 
   // Poll output latency every 2s — picks up headphone/BT changes automatically.
   // Only update the ref when the value shifts significantly (>10ms),
@@ -94,15 +98,21 @@ export default function App() {
       // Drift correction via playback rate adjustment.
       // Small drift: nudge rate to gradually close the gap.
       // Large drift: hard re-seek (unavoidable gap, but rare).
-      const NUDGE_START_MS = 100;   // start correcting above this
+      const NUDGE_START_MS = 50;   // start correcting above this
       const NUDGE_STOP_MS = 15;    // stop correcting below this (hysteresis)
       const HARD_DRIFT_THRESHOLD_MS = 1500;
       const RATE_NUDGE = 0.03;
 
-      // Track desired rate locally to avoid redundant setRateAsync calls
+      // Track desired rate locally to avoid redundant setRateAsync calls.
+      // After any rate change, AVPlayer fires a burst of rapid status callbacks
+      // with stale position data. We record the change time and ignore drift
+      // decisions for a short window to let the burst settle.
+      const RATE_CHANGE_COOLDOWN_MS = 1000;
       const setRateIfChanged = async (rate: number) => {
         if (currentRateRef.current !== rate) {
           currentRateRef.current = rate;
+          lastRateChangeTimeRef.current = Date.now();
+          setDisplayRate(rate);
           await sound.setRateAsync(rate, false);
         }
       };
@@ -112,6 +122,7 @@ export default function App() {
         setPositionMs(status.positionMillis);
 
         if (isSyncingRef.current) return;
+        if (Date.now() - lastRateChangeTimeRef.current < RATE_CHANGE_COOLDOWN_MS) return;
 
         const now = Date.now();
         const expectedPos =
@@ -121,6 +132,10 @@ export default function App() {
         const half = trackDurationMsRef.current / 2;
         if (drift > half) drift -= trackDurationMsRef.current;
         if (drift < -half) drift += trackDurationMsRef.current;
+
+        console.log(
+          `[${DEVICE_ID}] pos=${status.positionMillis} exp=${Math.round(expectedPos)} drift=${Math.round(drift)} rate=${currentRateRef.current}`
+        );
 
         if (Math.abs(drift) >= HARD_DRIFT_THRESHOLD_MS) {
           hardSync();
@@ -189,6 +204,8 @@ export default function App() {
       <View style={styles.debugPanel}>
         <Text style={styles.debugLabel}>track pos</Text>
         <Text style={styles.debugValue}>{formatPosition(positionMs)}</Text>
+        <Text style={styles.debugLabel}>rate</Text>
+        <Text style={styles.debugValue}>{displayRate.toFixed(2)}x</Text>
         <Text style={styles.debugLabel}>output latency</Text>
         <Text style={styles.debugValue}>{latencyMs.toFixed(1)}ms</Text>
       </View>
