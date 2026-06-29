@@ -1,6 +1,40 @@
 # silentdisco
 Latency-synced mobile device bluetooth headphone listening
 
+# Quickstart
+**First**, make sure you have the server's internal network IP address (through e.g. Network Settings -> Details) and **put the IP address into `api.ts` as `export const SERVER_URL = "http://192.168.0.176:8000"`
+
+Then, make sure all dependencies are up-to-date:
+```
+cd silentdisco/app
+npm install
+```
+
+To run simple expo apps (those which don't require building device-specific drivers, such as the adio latency hook):
+```
+npx expo start
+```
+
+### Workflow with Custom native components
+For devices which require additional native components:
+```
+npx expo prebuild --platform ios
+```
+
+
+```
+npx expo run:ios --device
+```
+Select device to which you want to deploy/build
+
+
+## Server
+```
+cd silentdisco/server/
+source venv/bin/activate
+pip install -r requirements.txt
+uvicorn main:app --reload --host 0.0.0.0
+```
 
 ## Goals and context
 

@@ -9,6 +9,7 @@ import {
   View,
 } from "react-native";
 import { fetchSession, SERVER_URL } from "./src/api";
+import { getOutputLatencyMs } from "./modules/audio-latency";
 
 type AppState = "idle" | "loading" | "syncing" | "playing" | "error";
 
@@ -37,8 +38,28 @@ export default function App() {
   const loopStartMsRef = useRef(0);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [positionMs, setPositionMs] = useState(0);
+  const [latencyMs, setLatencyMs] = useState(0);
+  const outputLatencyRef = useRef(0);
   const isSyncingRef = useRef(false);
   const currentRateRef = useRef(1.0);
+
+  // Poll output latency every 2s — picks up headphone/BT changes automatically.
+  // Only update the ref when the value shifts significantly (>10ms),
+  // to avoid drift correction reacting to minor fluctuations.
+  useEffect(() => {
+    const poll = () => {
+      const ms = getOutputLatencyMs();
+      setLatencyMs(ms);
+      if (Math.abs(ms - outputLatencyRef.current) > 10) {
+        outputLatencyRef.current = ms;
+      }
+    };
+    poll();
+    // On first read, always set it
+    outputLatencyRef.current = getOutputLatencyMs();
+    const id = setInterval(poll, 2000);
+    return () => clearInterval(id);
+  }, []);
 
   // Live clock — update every 16ms (~60fps)
   useEffect(() => {
@@ -75,21 +96,24 @@ export default function App() {
       soundRef.current = sound;
 
       const hardSync = async () => {
+        const latency = outputLatencyRef.current;
         const approxOffset =
-          (Date.now() - session.loopStartTimeMs) % session.trackDurationMs;
+          (Date.now() + latency - session.loopStartTimeMs) % session.trackDurationMs;
         await sound.setPositionAsync(approxOffset);
         const offset =
-          (Date.now() - session.loopStartTimeMs) % session.trackDurationMs;
+          (Date.now() + latency - session.loopStartTimeMs) % session.trackDurationMs;
         await sound.setPositionAsync(offset);
+        currentRateRef.current = 1.0;
         await sound.setRateAsync(1.0, true);
         await sound.playAsync();
       };
 
       // Drift correction via playback rate adjustment.
-      // Small drift (<200ms): nudge rate to 0.98 or 1.02 to close the gap.
-      // Large drift (>=200ms): hard re-seek (unavoidable gap, but rare).
-      const SOFT_DRIFT_THRESHOLD_MS = 30;
-      const HARD_DRIFT_THRESHOLD_MS = 200;
+      // Small drift: nudge rate to gradually close the gap.
+      // Large drift: hard re-seek (unavoidable gap, but rare).
+      const NUDGE_START_MS = 40;   // start correcting above this
+      const NUDGE_STOP_MS = 15;    // stop correcting below this (hysteresis)
+      const HARD_DRIFT_THRESHOLD_MS = 500;
       const RATE_NUDGE = 0.02;
 
       // Track desired rate locally to avoid redundant setRateAsync calls
@@ -112,26 +136,32 @@ export default function App() {
         if (isSyncingRef.current) return;
 
         const now = Date.now();
-        const wallClockPos =
-          (now - loopStartMsRef.current) % trackDurationMsRef.current;
-        const drift = status.positionMillis - wallClockPos;
+        const expectedPos =
+          (now + outputLatencyRef.current - loopStartMsRef.current) % trackDurationMsRef.current;
+        let drift = status.positionMillis - expectedPos;
+        // Handle wraparound at track boundary
+        const half = trackDurationMsRef.current / 2;
+        if (drift > half) drift -= trackDurationMsRef.current;
+        if (drift < -half) drift += trackDurationMsRef.current;
 
         if (Math.abs(drift) >= HARD_DRIFT_THRESHOLD_MS) {
           isSyncingRef.current = true;
           hardSync().finally(() => {
             isSyncingRef.current = false;
           });
-        } else if (Math.abs(drift) > SOFT_DRIFT_THRESHOLD_MS) {
+        } else if (Math.abs(drift) > NUDGE_START_MS) {
+          // Start nudging
           const targetRate = drift > 0 ? 1.0 - RATE_NUDGE : 1.0 + RATE_NUDGE;
           setRateIfChanged(targetRate);
-        } else {
+        } else if (Math.abs(drift) < NUDGE_STOP_MS) {
+          // Only stop nudging when well within tolerance (hysteresis)
           setRateIfChanged(1.0);
         }
+        // Between NUDGE_STOP and NUDGE_START: keep current rate (no change)
       });
 
-      // Check drift every 500ms — frequent enough to correct, rare enough
-      // to not interfere with audio playback
-      await sound.setProgressUpdateIntervalAsync(500);
+      // Check drift every 1s
+      await sound.setProgressUpdateIntervalAsync(1000);
 
       await hardSync();
       setAppState("playing");
@@ -186,6 +216,8 @@ export default function App() {
         <Text style={styles.debugValue}>{formatClock(nowMs)}</Text>
         <Text style={styles.debugLabel}>track pos</Text>
         <Text style={styles.debugValue}>{formatPosition(positionMs)}</Text>
+        <Text style={styles.debugLabel}>output latency</Text>
+        <Text style={styles.debugValue}>{latencyMs.toFixed(1)}ms</Text>
       </View>
 
       <Text style={styles.title}>silent disco</Text>

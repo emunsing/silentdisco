@@ -1,4 +1,4 @@
-export const SERVER_URL = "http://192.168.0.176:8000";
+export const SERVER_URL = "http://192.168.0.80:8000";
 
 export interface Session {
   trackDurationMs: number;
