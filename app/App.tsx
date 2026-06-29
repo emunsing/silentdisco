@@ -91,47 +91,41 @@ export default function App() {
 
       const { sound } = await Audio.Sound.createAsync(
         { uri: `${SERVER_URL}/audio/track` },
-        { shouldPlay: false }
+        { shouldPlay: false, isLooping: true }
       );
       soundRef.current = sound;
 
       const hardSync = async () => {
+        isSyncingRef.current = true;
         const latency = outputLatencyRef.current;
-        const approxOffset =
-          (Date.now() + latency - session.loopStartTimeMs) % session.trackDurationMs;
-        await sound.setPositionAsync(approxOffset);
         const offset =
           (Date.now() + latency - session.loopStartTimeMs) % session.trackDurationMs;
         await sound.setPositionAsync(offset);
         currentRateRef.current = 1.0;
-        await sound.setRateAsync(1.0, true);
+        await sound.setRateAsync(1.0, false);
         await sound.playAsync();
+        isSyncingRef.current = false;
       };
 
       // Drift correction via playback rate adjustment.
       // Small drift: nudge rate to gradually close the gap.
       // Large drift: hard re-seek (unavoidable gap, but rare).
-      const NUDGE_START_MS = 40;   // start correcting above this
+      const NUDGE_START_MS = 100;   // start correcting above this
       const NUDGE_STOP_MS = 15;    // stop correcting below this (hysteresis)
-      const HARD_DRIFT_THRESHOLD_MS = 500;
-      const RATE_NUDGE = 0.02;
+      const HARD_DRIFT_THRESHOLD_MS = 1500;
+      const RATE_NUDGE = 0.03;
 
       // Track desired rate locally to avoid redundant setRateAsync calls
       const setRateIfChanged = async (rate: number) => {
         if (currentRateRef.current !== rate) {
           currentRateRef.current = rate;
-          await sound.setRateAsync(rate, true);
+          await sound.setRateAsync(rate, false);
         }
       };
 
       sound.setOnPlaybackStatusUpdate((status: AVPlaybackStatus) => {
         if (!status.isLoaded || !status.isPlaying) return;
         setPositionMs(status.positionMillis);
-
-        if (status.didJustFinish) {
-          hardSync();
-          return;
-        }
 
         if (isSyncingRef.current) return;
 
@@ -145,10 +139,7 @@ export default function App() {
         if (drift < -half) drift += trackDurationMsRef.current;
 
         if (Math.abs(drift) >= HARD_DRIFT_THRESHOLD_MS) {
-          isSyncingRef.current = true;
-          hardSync().finally(() => {
-            isSyncingRef.current = false;
-          });
+          hardSync();
         } else if (Math.abs(drift) > NUDGE_START_MS) {
           // Start nudging
           const targetRate = drift > 0 ? 1.0 - RATE_NUDGE : 1.0 + RATE_NUDGE;
@@ -160,8 +151,8 @@ export default function App() {
         // Between NUDGE_STOP and NUDGE_START: keep current rate (no change)
       });
 
-      // Check drift every 1s
-      await sound.setProgressUpdateIntervalAsync(1000);
+      // Check drift every 500ms
+      await sound.setProgressUpdateIntervalAsync(500);
 
       await hardSync();
       setAppState("playing");
