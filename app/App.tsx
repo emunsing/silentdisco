@@ -13,19 +13,10 @@ import { getOutputLatencyMs } from "./modules/audio-latency";
 
 type AppState = "idle" | "loading" | "syncing" | "playing" | "error";
 
-function formatClock(ms: number): string {
-  const d = new Date(ms);
-  const h = d.getHours().toString().padStart(2, "0");
-  const m = d.getMinutes().toString().padStart(2, "0");
-  const s = d.getSeconds().toString().padStart(2, "0");
-  const mil = d.getMilliseconds().toString().padStart(3, "0");
-  return `${h}:${m}:${s}.${mil}`;
-}
-
 function formatPosition(ms: number): string {
   const totalSec = Math.floor(ms / 1000);
-  const min = Math.floor(totalSec / 60);
-  const sec = (totalSec % 60).toString().padStart(2, "0");
+  const min = Math.floor(totalSec / 10);
+  const sec = (totalSec % 10).toString().padStart(2, "0");
   const mil = (ms % 1000).toString().padStart(3, "0");
   return `${min}:${sec}.${mil}`;
 }
@@ -36,7 +27,6 @@ export default function App() {
   const soundRef = useRef<Audio.Sound | null>(null);
   const trackDurationMsRef = useRef(0);
   const loopStartMsRef = useRef(0);
-  const [nowMs, setNowMs] = useState(() => Date.now());
   const [positionMs, setPositionMs] = useState(0);
   const [latencyMs, setLatencyMs] = useState(0);
   const outputLatencyRef = useRef(0);
@@ -58,12 +48,6 @@ export default function App() {
     // On first read, always set it
     outputLatencyRef.current = getOutputLatencyMs();
     const id = setInterval(poll, 2000);
-    return () => clearInterval(id);
-  }, []);
-
-  // Live clock — update every 16ms (~60fps)
-  useEffect(() => {
-    const id = setInterval(() => setNowMs(Date.now()), 16);
     return () => clearInterval(id);
   }, []);
 
@@ -203,8 +187,6 @@ export default function App() {
       <StatusBar barStyle="light-content" />
 
       <View style={styles.debugPanel}>
-        <Text style={styles.debugLabel}>clock</Text>
-        <Text style={styles.debugValue}>{formatClock(nowMs)}</Text>
         <Text style={styles.debugLabel}>track pos</Text>
         <Text style={styles.debugValue}>{formatPosition(positionMs)}</Text>
         <Text style={styles.debugLabel}>output latency</Text>
