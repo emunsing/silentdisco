@@ -1,4 +1,4 @@
-import { Audio, AVPlaybackStatus } from "expo-av";
+import * as FileSystem from "expo-file-system/legacy";
 import { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -10,6 +10,7 @@ import {
 } from "react-native";
 import { fetchSession, SERVER_URL } from "./src/api";
 import { getOutputLatencyMs } from "./modules/audio-latency";
+import * as SyncedPlayer from "./modules/synced-player";
 
 type AppState = "idle" | "loading" | "syncing" | "playing" | "error";
 
@@ -26,7 +27,6 @@ function formatPosition(ms: number): string {
 export default function App() {
   const [appState, setAppState] = useState<AppState>("idle");
   const [errorMsg, setErrorMsg] = useState("");
-  const soundRef = useRef<Audio.Sound | null>(null);
   const trackDurationMsRef = useRef(0);
   const loopStartMsRef = useRef(0);
   const [positionMs, setPositionMs] = useState(0);
@@ -36,6 +36,7 @@ export default function App() {
   const isSyncingRef = useRef(false);
   const currentRateRef = useRef(1.0);
   const lastRateChangeTimeRef = useRef(0);
+  const statusSubRef = useRef<{ remove: () => void } | null>(null);
 
   // Poll output latency every 2s — picks up headphone/BT changes automatically.
   // Only update the ref when the value shifts significantly (>10ms),
@@ -57,7 +58,9 @@ export default function App() {
 
   useEffect(() => {
     return () => {
-      soundRef.current?.unloadAsync();
+      statusSubRef.current?.remove();
+      SyncedPlayer.stopAsync();
+      SyncedPlayer.unloadAsync();
     };
   }, []);
 
@@ -66,60 +69,54 @@ export default function App() {
       setAppState("loading");
       setErrorMsg("");
 
-      await Audio.setAudioModeAsync({
-        playsInSilentModeIOS: true,
-        staysActiveInBackground: true,
-        shouldDuckAndroid: false,
-      });
-
       const session = await fetchSession();
       trackDurationMsRef.current = session.trackDurationMs;
       loopStartMsRef.current = session.loopStartTimeMs;
       setAppState("syncing");
 
-      const { sound } = await Audio.Sound.createAsync(
-        { uri: `${SERVER_URL}/audio/track` },
-        { shouldPlay: false, isLooping: true }
-      );
-      soundRef.current = sound;
+      // Download audio to local cache so AVAudioFile can read it.
+      const localUri = FileSystem.cacheDirectory + "track.mp3";
+      await FileSystem.downloadAsync(`${SERVER_URL}/audio/track`, localUri);
+
+      // Load into AVAudioEngine (in-memory PCM buffer).
+      await SyncedPlayer.loadAsync(localUri);
 
       const hardSync = async () => {
         isSyncingRef.current = true;
         const latency = outputLatencyRef.current;
         const offset =
           (Date.now() + latency - session.loopStartTimeMs) % session.trackDurationMs;
-        await sound.setPositionAsync(offset);
         currentRateRef.current = 1.0;
-        await sound.setRateAsync(1.0, false);
-        await sound.playAsync();
+        SyncedPlayer.setRate(1.0);
+        await SyncedPlayer.playAsync(offset);
         isSyncingRef.current = false;
       };
 
       // Drift correction via playback rate adjustment.
-      // Small drift: nudge rate to gradually close the gap.
-      // Large drift: hard re-seek (unavoidable gap, but rare).
-      const NUDGE_START_MS = 50;   // start correcting above this
-      const NUDGE_STOP_MS = 15;    // stop correcting below this (hysteresis)
+      // Small drift: nudge AVAudioUnitVarispeed.rate to close the gap — seamless,
+      // no buffer flush, no audible gap.
+      // Large drift: hard re-seek via playAsync (audible but rare).
+      const NUDGE_START_MS = 50;
+      const NUDGE_STOP_MS = 15;
       const HARD_DRIFT_THRESHOLD_MS = 1500;
       const RATE_NUDGE = 0.03;
 
-      // Track desired rate locally to avoid redundant setRateAsync calls.
-      // After any rate change, AVPlayer fires a burst of rapid status callbacks
-      // with stale position data. We record the change time and ignore drift
-      // decisions for a short window to let the burst settle.
+      // After a rate change, AVAudioEngine can fire several status callbacks
+      // with stale position data. Ignore drift decisions for a short window.
       const RATE_CHANGE_COOLDOWN_MS = 1000;
-      const setRateIfChanged = async (rate: number) => {
+      const setRateIfChanged = (rate: number) => {
         if (currentRateRef.current !== rate) {
           currentRateRef.current = rate;
           lastRateChangeTimeRef.current = Date.now();
           setDisplayRate(rate);
-          await sound.setRateAsync(rate, false);
+          SyncedPlayer.setRate(rate); // synchronous DSP param change, no await
         }
       };
 
-      sound.setOnPlaybackStatusUpdate((status: AVPlaybackStatus) => {
-        if (!status.isLoaded || !status.isPlaying) return;
-        setPositionMs(status.positionMillis);
+      statusSubRef.current?.remove();
+      statusSubRef.current = SyncedPlayer.addStatusListener((status) => {
+        if (!status.isPlaying || status.positionMs < 0) return;
+        setPositionMs(status.positionMs);
 
         if (isSyncingRef.current) return;
         if (Date.now() - lastRateChangeTimeRef.current < RATE_CHANGE_COOLDOWN_MS) return;
@@ -127,31 +124,26 @@ export default function App() {
         const now = Date.now();
         const expectedPos =
           (now + outputLatencyRef.current - loopStartMsRef.current) % trackDurationMsRef.current;
-        let drift = status.positionMillis - expectedPos;
+        let drift = status.positionMs - expectedPos;
         // Handle wraparound at track boundary
         const half = trackDurationMsRef.current / 2;
         if (drift > half) drift -= trackDurationMsRef.current;
         if (drift < -half) drift += trackDurationMsRef.current;
 
         console.log(
-          `[${DEVICE_ID}] pos=${status.positionMillis} exp=${Math.round(expectedPos)} drift=${Math.round(drift)} rate=${currentRateRef.current}`
+          `[${DEVICE_ID}] pos=${status.positionMs.toFixed(0)} exp=${Math.round(expectedPos)} drift=${Math.round(drift)} rate=${currentRateRef.current}`
         );
 
         if (Math.abs(drift) >= HARD_DRIFT_THRESHOLD_MS) {
           hardSync();
         } else if (Math.abs(drift) > NUDGE_START_MS) {
-          // Start nudging
           const targetRate = drift > 0 ? 1.0 - RATE_NUDGE : 1.0 + RATE_NUDGE;
           setRateIfChanged(targetRate);
         } else if (Math.abs(drift) < NUDGE_STOP_MS) {
-          // Only stop nudging when well within tolerance (hysteresis)
           setRateIfChanged(1.0);
         }
         // Between NUDGE_STOP and NUDGE_START: keep current rate (no change)
       });
-
-      // Check drift every 500ms
-      await sound.setProgressUpdateIntervalAsync(500);
 
       await hardSync();
       setAppState("playing");
@@ -163,11 +155,10 @@ export default function App() {
   }
 
   async function disconnect() {
-    if (soundRef.current) {
-      await soundRef.current.stopAsync();
-      await soundRef.current.unloadAsync();
-      soundRef.current = null;
-    }
+    statusSubRef.current?.remove();
+    statusSubRef.current = null;
+    await SyncedPlayer.stopAsync();
+    await SyncedPlayer.unloadAsync();
     setPositionMs(0);
     trackDurationMsRef.current = 0;
     loopStartMsRef.current = 0;
