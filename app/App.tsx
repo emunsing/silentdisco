@@ -36,6 +36,11 @@ export default function App() {
   const isSyncingRef = useRef(false);
   const currentRateRef = useRef(1.0);
   const lastRateChangeTimeRef = useRef(0);
+  // PI controller state
+  const integralRateRef = useRef(0);      // learned baseline rate offset (compensates clock drift)
+  const smoothedDriftRateRef = useRef(0); // EMA of drift rate in ms/sec
+  const prevDriftRef = useRef<number | null>(null);
+  const prevCallbackTimeRef = useRef(Date.now());
 
   // Poll output latency every 2s — picks up headphone/BT changes automatically.
   // Only update the ref when the value shifts significantly (>10ms),
@@ -95,19 +100,32 @@ export default function App() {
         isSyncingRef.current = false;
       };
 
-      // Drift correction via playback rate adjustment.
-      // Small drift: nudge rate to gradually close the gap.
-      // Large drift: hard re-seek (unavoidable gap, but rare).
-      const NUDGE_START_MS = 50;   // start correcting above this
-      const NUDGE_STOP_MS = 15;    // stop correcting below this (hysteresis)
+      // PI rate controller.
+      //
+      // P term: multi-level discrete correction. Three bands give fast convergence
+      // from large drifts while keeping rate changes infrequent.
+      //
+      // I term: EMA of the observed drift rate (ms/sec), measured only while in
+      // the dead band so P-term corrections don't contaminate the estimate. Once
+      // learned, the integral offsets the baseline rate to cancel the device's
+      // persistent clock error, meaning P rarely needs to fire in steady state.
+      //
+      // Quantised to 0.5% steps so the integral accumulates silently until it
+      // crosses a threshold, limiting how often setRateAsync is called.
+      const DEAD_BAND_MS = 10;
+      const P_MEDIUM_MS = 50;
+      const P_LARGE_MS = 200;
       const HARD_DRIFT_THRESHOLD_MS = 1500;
-      const RATE_NUDGE = 0.03;
-
-      // Track desired rate locally to avoid redundant setRateAsync calls.
-      // After any rate change, AVPlayer fires a burst of rapid status callbacks
-      // with stale position data. We record the change time and ignore drift
-      // decisions for a short window to let the burst settle.
+      const P_SMALL_RATE = 0.01;
+      const P_MEDIUM_RATE = 0.03;
+      const P_LARGE_RATE = 0.06;
+      const INTEGRAL_ALPHA = 0.025;   // EMA decay; ~10-callback (~5s) time constant
+      const INTEGRAL_MAX = 0.03;    // cap integral at ±3%
+      const QUANTIZE_STEP = 0.001;  // only apply rate changes in 0.1% increments
       const RATE_CHANGE_COOLDOWN_MS = 1000;
+
+      // Only call setRateAsync when the rate actually changes, and record the
+      // time so the cooldown can suppress the phantom-drift callback burst.
       const setRateIfChanged = async (rate: number) => {
         if (currentRateRef.current !== rate) {
           currentRateRef.current = rate;
@@ -122,32 +140,83 @@ export default function App() {
         setPositionMs(status.positionMillis);
 
         if (isSyncingRef.current) return;
-        if (Date.now() - lastRateChangeTimeRef.current < RATE_CHANGE_COOLDOWN_MS) return;
 
         const now = Date.now();
+
+        // During cooldown after a rate change, AVPlayer fires phantom callbacks
+        // with stale position data. Discard them and invalidate prevDrift so the
+        // integral doesn't learn from readings that straddle a rate change.
+        if (now - lastRateChangeTimeRef.current < RATE_CHANGE_COOLDOWN_MS) {
+          prevDriftRef.current = null;
+          return;
+        }
+
         const expectedPos =
           (now + outputLatencyRef.current - loopStartMsRef.current) % trackDurationMsRef.current;
         let drift = status.positionMillis - expectedPos;
-        // Handle wraparound at track boundary
         const half = trackDurationMsRef.current / 2;
         if (drift > half) drift -= trackDurationMsRef.current;
         if (drift < -half) drift += trackDurationMsRef.current;
 
-        console.log(
-          `[${DEVICE_ID}] pos=${status.positionMillis} exp=${Math.round(expectedPos)} drift=${Math.round(drift)} rate=${currentRateRef.current}`
-        );
+        // dt since last accepted callback (excludes cooldown gaps).
+        // prevCallbackTimeRef is only updated below, so a long gap (cooldown)
+        // gives dt > 1.5s and prevents a stale integral update.
+        const dt = (now - prevCallbackTimeRef.current) / 1000;
 
+        // Proportional term — multi-level discrete correction.
+        let proportional = 0;
         if (Math.abs(drift) >= HARD_DRIFT_THRESHOLD_MS) {
           hardSync();
-        } else if (Math.abs(drift) > NUDGE_START_MS) {
-          // Start nudging
-          const targetRate = drift > 0 ? 1.0 - RATE_NUDGE : 1.0 + RATE_NUDGE;
-          setRateIfChanged(targetRate);
-        } else if (Math.abs(drift) < NUDGE_STOP_MS) {
-          // Only stop nudging when well within tolerance (hysteresis)
-          setRateIfChanged(1.0);
+          prevDriftRef.current = null;
+          prevCallbackTimeRef.current = now;
+          return;
+        } else if (Math.abs(drift) > P_LARGE_MS) {
+          proportional = drift < 0 ? P_LARGE_RATE : -P_LARGE_RATE;
+        } else if (Math.abs(drift) > P_MEDIUM_MS) {
+          proportional = drift < 0 ? P_MEDIUM_RATE : -P_MEDIUM_RATE;
+        } else if (Math.abs(drift) > DEAD_BAND_MS) {
+          proportional = drift < 0 ? P_SMALL_RATE : -P_SMALL_RATE;
         }
-        // Between NUDGE_STOP and NUDGE_START: keep current rate (no change)
+
+        // Integral term — update only in the dead band with valid consecutive readings.
+        // This ensures we measure the natural clock drift rate, not correction artefacts.
+        if (
+          proportional === 0 &&
+          prevDriftRef.current !== null &&
+          dt > 0.3 && dt < 1.5
+        ) {
+          const driftRateMs = (drift - prevDriftRef.current) / dt; // ms/sec
+          smoothedDriftRateRef.current =
+            (1 - INTEGRAL_ALPHA) * smoothedDriftRateRef.current +
+            INTEGRAL_ALPHA * driftRateMs;
+          // Convert drift rate to rate offset: falling behind → speed up → positive offset.
+          integralRateRef.current = Math.max(
+            -INTEGRAL_MAX,
+            Math.min(INTEGRAL_MAX, -smoothedDriftRateRef.current / 1000)
+          );
+        }
+
+        // Combine P + I and quantise to limit setRateAsync call frequency.
+        const rawRate = 1.0 + integralRateRef.current + proportional;
+        const quantizedRate =
+          Math.round(rawRate / QUANTIZE_STEP) * QUANTIZE_STEP;
+
+        console.log(
+          `[${DEVICE_ID}] pos=${status.positionMillis} exp=${Math.round(expectedPos)} ` +
+          `drift=${Math.round(drift)} p=${proportional.toFixed(2)} ` +
+          `i=${integralRateRef.current.toFixed(4)} rate=${quantizedRate.toFixed(3)}`
+        );
+
+        // Null prevDrift on rate change so the integral doesn't learn across
+        // a boundary where the cooldown will suppress intermediate callbacks.
+        if (quantizedRate !== currentRateRef.current) {
+          prevDriftRef.current = null;
+        } else {
+          prevDriftRef.current = drift;
+        }
+        prevCallbackTimeRef.current = now;
+
+        setRateIfChanged(quantizedRate);
       });
 
       // Check drift every 500ms
@@ -169,8 +238,13 @@ export default function App() {
       soundRef.current = null;
     }
     setPositionMs(0);
+    setDisplayRate(1.0);
     trackDurationMsRef.current = 0;
     loopStartMsRef.current = 0;
+    integralRateRef.current = 0;
+    smoothedDriftRateRef.current = 0;
+    prevDriftRef.current = null;
+    currentRateRef.current = 1.0;
     setAppState("idle");
   }
 
@@ -205,7 +279,7 @@ export default function App() {
         <Text style={styles.debugLabel}>track pos</Text>
         <Text style={styles.debugValue}>{formatPosition(positionMs)}</Text>
         <Text style={styles.debugLabel}>rate</Text>
-        <Text style={styles.debugValue}>{displayRate.toFixed(2)}x</Text>
+        <Text style={styles.debugValue}>{displayRate.toFixed(3)}x</Text>
         <Text style={styles.debugLabel}>output latency</Text>
         <Text style={styles.debugValue}>{latencyMs.toFixed(1)}ms</Text>
       </View>
